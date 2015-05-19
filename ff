@@ -1,0 +1,536 @@
+#!/usr/bin/node
+
+var fs = require('fs');
+var child = require('child_process');
+
+var doExit = function(err, info) {
+  console.error(err, info === undefined ? '' : JSON.stringify(info));
+  process.exit(1);
+};
+
+var getFullPath = function(path, name) {
+  return path.charAt(path.length - 1) == '/' || name.charAt(0) == '/' ? path + name : path + '/' + name;
+};
+
+var serial = function(items, func, itemsDoneCallback) { // destroys items array (shift)
+  if (items.length == 0) {
+    itemsDoneCallback();
+  } else {
+    func(items.shift(), function() {
+      serial(items, func, itemsDoneCallback);
+    });
+  }
+};
+
+var guessEncoding = function(buffer, len) {
+
+  var nZeroOdd = 0;
+  var nZeroEven = 0;
+  var nControl = 0;
+  var nASCII = 0;
+  var nHigh = 0;
+  var nOther = 0;;
+
+  for (var i = 0; i < len; ++i) {
+    var bi = buffer[i];
+    if (bi == 0x00)
+      i % 2  == 0 ? ++nZeroEven : ++nZeroOdd;
+    else if (bi < 0x09)
+      ++nOther;
+    else if (bi <= 0x0d)
+      ++nControl;
+    else if (bi < 0x20)
+      ++nOther;
+    else if (bi < 0x80)
+      ++nASCII;
+    else
+      ++nHigh;
+  }
+
+  if (len == nASCII + nControl)
+    return {encoding: 'ascii', skip: 0};
+
+  if (len > 2 && nZeroOdd  > (len - 2) / 3 && buffer[0] == 0xff && buffer[1] == 0xfe)
+    return {encoding: 'utf16le', skip: 2};
+
+  if (len > 3 && buffer[0] == 0xef && buffer[1] == 0xbb && buffer[2] == 0xbf)
+    return {encoding: 'utf8', skip: 3};
+
+  return {encoding: 'binary', skip: 0};
+};
+
+var grep = function(re, file, grepDoneCallback) {
+  fs.open(file, 'r', function(err, fd) {
+    if (err) {
+      if (err.code != 'EACCES' || argTab.e.value == null)
+        console.error('***', err.code, file);
+      grepDoneCallback();
+    } else {
+      var chunk = new Buffer(25600);
+      var encodingInfo = null;
+      var str = '';
+      var nLines = 0;
+      var maxLineLength = 2048;
+      var abort = false;
+
+      var handleRead = function(err, bytesRead, chunk) {
+        if (err) {
+          if (err.code != 'EACCES' || argTab.e.value == null)
+            console.error('***', err.code, file);
+          grepDoneCallback();
+        } else {
+          if (encodingInfo == null)
+            encodingInfo = guessEncoding(chunk, bytesRead);
+          //if (encodingInfo.encoding != 'ascii' && encodingInfo.encoding != 'binary') console.log('\n@@@@ ' + encodingInfo.encoding + ' ' + file + '\n');
+          if (encodingInfo.encoding != 'binary') {
+            if (bytesRead > 0) {
+              str += chunk.toString(encodingInfo.encoding, encodingInfo.skip, bytesRead);
+              encodingInfo.skip = 0;
+            }
+
+            if (str.length > 0) {
+              var e = bytesRead == 0 ? str.length : str.indexOf('\n');
+              if (e < maxLineLength) {
+                while (e != -1) {
+                  line = str.substring(0, e > 0 && str.charAt(e - 1) == '\r' ? e - 1 : e);
+                  ++nLines;
+                  if (re.test(line))
+                    process.stdout.write(file + ':' + nLines + ':' + line + '\n');
+                  str = str.substring(e + 1);
+                  e = str.indexOf('\n');
+                }
+              } else {
+                if (!argTab.e.value)
+                  process.stdout.write(file + ':' + nLines + ': LINE TOO LONG (' + maxLineLength + ')\n');
+                abort = true;
+              }
+            }
+
+          }
+          if (!abort && bytesRead > 0 && encodingInfo.encoding != 'binary') {
+            fs.read(fd, chunk, 0, chunk.length, null, handleRead);
+          } else {
+            fs.close(fd);
+            grepDoneCallback();
+          }
+        }
+      };
+
+      fs.read(fd, chunk, 0, 256, null, handleRead);
+    }
+  });
+};
+
+var userMap = [];
+var groupMap = [];
+var needUserMaps;
+var parms = [];
+
+var parseArgs = function(args) {
+  var now = new Date();
+  for (var i = 0; i < args.length; ++i) {
+    var arg = args[i];
+    if (arg.charAt(0) == '-') {
+      var argTabEntry = argTab[arg.substring(1)];
+      if (argTabEntry === undefined || (i + 1 >= args.length && argTabEntry.type != 'b'))
+        doExit('Invalid Option', arg);
+      if (argTabEntry.value != null)
+        doExit('Option can only appear once', arg);
+      switch (argTabEntry.type) {
+        case 'b':
+          argTabEntry.value =  true;
+          break;
+        case 's':
+          argTabEntry.value =  args[++i];
+          break;
+        case 'r':
+          argTabEntry.value =  new RegExp('^' + args[++i] + '$', argTab.i.value !== null ? 'i' : '');
+          break;
+        case 'x':
+          argTabEntry.value =  new RegExp(args[++i], argTab.i.value !== null ? 'i' : '');
+          break;
+        case 't': // time
+          var matches = args[++i].match(/^([0-9]+)([smhd]?)$/);
+          if (matches === null) doExit('Invalid time specifier: ' + args[i]);
+          var time = parseInt(matches[1], 10);
+          switch (matches[2]) {
+            case 'm': time *= 60;           break;
+            case 'h': time *= 60 * 60;      break;
+            case 'd': time *= 60 * 60 * 24; break;
+          }
+          argTabEntry.value = now.getTime() - time * 1000;
+          break;
+        case 'z': // size
+          var matches = args[++i].match(/^([0-9]+)([bkmg]?)$/);
+          if (matches === null) doExit('Invalid time specifier: ' + args[i]);
+          var size = parseInt(matches[1], 10);
+          switch (matches[2]) {
+            case 'k': size *= 1000;       break;
+            case 'm': size *= 1000000;    break;
+            case 'g': size *= 1000000000; break;
+          }
+        argTabEntry.value = size;
+          break;
+      }
+    } else {
+      parms.push(arg);
+    }
+  };
+};
+
+var getUserMaps = function(userMapsDoneCallback) {
+  if (needUserMaps) {
+    var done = 0;
+    child.exec('getent passwd', function (error, stdout, stderr) {
+      if (error)
+        doExit(error, 'getent passwd');
+      stdout.split('\n').forEach(function(line) {
+        var cols = line.split(':');
+        userMap[cols[2]] = cols[0];
+      });
+      if (++done == 2)
+        userMapsDoneCallback();
+    });
+    child.exec('getent group', function (error, stdout, stderr) {
+      if (error)
+        doExit(error, 'getent group');
+      stdout.split('\n').forEach(function(line) {
+        var cols = line.split(':');
+        groupMap[cols[2]] = cols[0];
+      });
+      if (++done == 2)
+        userMapsDoneCallback();
+    });
+  } else
+    userMapsDoneCallback();
+};
+
+var processEntry = function(xdev, path, name, handler, entryDoneCallback) {
+  var fullPath = getFullPath(path, name);
+  fs.lstat(fullPath, function(err, stats) {
+    handler(err, xdev, path, name, stats, function() {
+      if (!err && xdev == stats.dev && stats.isDirectory()) {
+        fs.readdir(fullPath, function(err, files) {
+          if (err) {
+            handler(err, xdev, path, name, null, function() {
+              entryDoneCallback();
+            });
+          } else {
+            serial(files, function(file, fileDoneCallback) {
+              processEntry(xdev, fullPath, file, handler, fileDoneCallback);
+            }, entryDoneCallback);
+          }
+        });
+      } else
+        entryDoneCallback();
+    });
+  });
+};
+
+var processDir = function(path, handler, dirDoneCallback) {
+  fs.lstat(path, function(err, stats) {
+    if (err)
+      doExit(err, {path: path});
+    if (!stats.isDirectory())
+      doExit('Must be a directory', {path: path});
+    var xdev = stats.dev;
+    fs.readdir(path, function(err, files) {
+      if (err) {
+        doExit(err, {path: path});
+      } else {
+        serial(files, function(file, fileDoneCallback) {
+          processEntry(xdev, path, file, handler, fileDoneCallback);
+        }, dirDoneCallback);
+      }
+    });
+  });
+};
+
+var typeString = function(stats) {
+  if (stats.isFile()) return 'f';
+  if (stats.isDirectory()) return 'd';
+  if (stats.isSymbolicLink()) return 'l';
+  if (stats.isBlockDevice()) return 'b';
+  if (stats.isCharacterDevice()) return 'c';
+  if (stats.isFIFO()) return 'p';
+  if (stats.isSocket()) return 's';
+  return '?';
+};
+
+var permString = function(stats) {
+  var mode = stats.mode;
+  return (((mode & 0400) != 0) ? 'r' : '-')
+    + (((mode & 0200) != 0) ? 'w' : '-')
+    + (((mode & 0100) != 0) ? 'x' : '-')
+    + (((mode & 040)  != 0) ? 'r' : '-')
+    + (((mode & 020)  != 0) ? 'w' : '-')
+    + (((mode & 010)  != 0) ? 'x' : '-')
+    + (((mode & 04)   != 0) ? 'r' : '-')
+    + (((mode & 02)   != 0) ? 'w' : '-')
+    + (((mode & 01)   != 0) ? 'x' : '-');
+};
+
+var permOctalString = function(stats) {
+  return padZero((stats.mode & 0777).toString(8), 3);
+};
+
+var modeLSString = function(stats) {
+  var mode = stats.mode;
+  var ox = mode & 04100;  // suid
+  var gx = mode & 02010;  // guid
+  var wx = mode & 01001;  // sticky
+  return (stats.isFile() ? '-' : typeString(stats))
+    + (((mode & 0400) != 0) ? 'r' : '-')
+    + (((mode & 0200) != 0) ? 'w' : '-')
+    + (ox == 00000 ? '-' : ox == 00100 ? 'x' : ox == 04100 ? 's' : 'S')
+    + (((mode & 040)  != 0) ? 'r' : '-')
+    + (((mode & 020)  != 0) ? 'w' : '-')
+    + (gx == 00000 ? '-' : gx == 00010 ? 'x' : gx == 02010 ? 's' : 'S')
+    + (((mode & 04)   != 0) ? 'r' : '-')
+    + (((mode & 02)   != 0) ? 'w' : '-')
+    + (wx == 00000 ? '-' : wx == 00001 ? 'x' : wx == 01001 ? 't' : 'T');
+};
+
+var pad = function(s, n) {
+  return s.length >= n ? s : ('                                                             ' + s).slice(-n);
+};
+
+var padZero = function(s, n) {
+  return s.length >= n ? s : ('0000000000000000000000000000000000000000000000000000000000000' + s).slice(-n);
+};
+
+var two = function(n) {
+  return n < 10 ? '0' + n : '' + n;
+};
+
+var dateToString = function(date) {
+  return date.getFullYear() + '-' + two(date.getMonth() + 1) + '-' + two(date.getDate())
+    + ' ' + two(date.getHours()) + ':' + two(date.getMinutes()) + ':' + two(date.getSeconds());
+};
+
+var argTab = {
+  'name':    {type: 'x', value: null},
+  '^name':   {type: 'x', value: null},
+  'fname':   {type: 'x', value: null},
+  '^fname':  {type: 'x', value: null},
+  'type':    {type: 'x', value: null},
+  '^type' :  {type: 'x', value: null},
+  'mtime':   {type: 't', value: null},
+  '^mtime':  {type: 't', value: null},
+  'atime':   {type: 't', value: null},
+  '^atime':  {type: 't', value: null},
+  'ctime':   {type: 't', value: null},
+  '^ctime':  {type: 't', value: null},
+  'btime':   {type: 't', value: null},
+  '^btime':  {type: 't', value: null},
+  'size':    {type: 'z', value: null},
+  '^size':   {type: 'z', value: null},
+  'user':    {type: 'x', value: null},
+  '^user':   {type: 'x', value: null},
+  'group':   {type: 'x', value: null},
+  '^group':  {type: 'x', value: null},
+  'perm':    {type: 'x', value: null},
+  '^perm':   {type: 'x', value: null},
+  'suid':    {type: 'b', value: null},
+  '^suid':   {type: 'b', value: null},
+  'guid':    {type: 'b', value: null},
+  '^guid':   {type: 'b', value: null},
+  'sticky':  {type: 'b', value: null},
+  '^sticky': {type: 'b', value: null},
+
+  'print':   {type: 'b', value: null},
+  'print0':  {type: 'b', value: null},
+  'ls':      {type: 'b', value: null},
+  'stat':    {type: 'b', value: null},
+  'grep':    {type: 'x', value: null},
+
+  'i':       {type: 'b', value: null},
+  'e':       {type: 'b', value: null},
+};
+
+var handleOne = function(err, xdev, path, name, stats, handlerCallback) {
+  var fullPath = getFullPath(path, name);
+  if (err) {
+    if (err.code != 'EACCES' || argTab.e.value == null)
+      console.error('***', err.code, fullPath);
+  } else {
+    var doAction = true;
+
+    if (doAction && argTab.name.value !== null && !argTab.name.value.test(name))
+      doAction = false;
+    if (doAction && argTab['^name'].value != null && argTab['^name'].value.test(name))
+      doAction = false;
+
+    if (doAction && argTab.fname.value !== null && !argTab.fname.value.test(fullPath))
+      doAction = false;
+    if (doAction && argTab['^fname'].value != null && argTab['^fname'].value.test(fullPath))
+      doAction = false;
+
+    if (doAction && argTab.type.value !== null && !argTab.type.value.test(typeString(stats)))
+      doAction = false;
+    if (doAction && argTab['^type'].value != null && argTab['^type'].value.test(typeString(stats)))
+      doAction = false;
+
+    if (doAction && argTab.mtime.value !== null && argTab.mtime.value > stats.mtime.getTime()) // no show if file modified before arg time
+      doAction = false;
+    if (doAction && argTab['^mtime'].value != null && !(argTab['^mtime'].value > stats.mtime.getTime()))
+      doAction = false;
+
+    if (doAction && argTab.size.value !== null && argTab.size.value < stats.size) // no show if file modified before arg time
+      doAction = false;
+    if (doAction && argTab['^size'].value != null && argTab['^size'].value >= stats.size)
+      doAction = false;
+
+    if (doAction && argTab.atime.value !== null && argTab.atime.value > stats.atime.getTime()) // no show if file accessed before arg time
+      doAction = false;
+    if (doAction && argTab['^atime'].value != null && !(argTab['^atime'].value > stats.atime.getTime()))
+      doAction = false;
+
+    if (doAction && argTab.ctime.value !== null && argTab.ctime.value > stats.ctime.getTime()) // no show if file changed before arg time
+      doAction = false;
+    if (doAction && argTab['^ctime'].value != null && !(argTab['^ctime'].value > stats.ctime.getTime()))
+      doAction = false;
+
+    if (doAction && argTab.btime.value !== null && argTab.btime.value > stats.birthtime.getTime()) // no show if file birthed before arg time
+      doAction = false;
+    if (doAction && argTab['^btime'].value != null && !(argTab['^btime'].value > stats.birthtime.getTime()))
+      doAction = false;
+
+    if (doAction && argTab.user.value !== null && !(argTab.user.value.test(stats.uid) || argTab.user.value.test(userMap[stats.uid])))
+      doAction = false;
+    if (doAction && argTab['^user'].value != null && (argTab['^user'].value.test(stats.uid) || argTab['^user'].value.test(userMap[stats.uid])))
+      doAction = false;
+
+    if (doAction && argTab.group.value !== null && !(argTab.group.value.test(stats.gid) || argTab.group.value.test(groupMap[stats.gid])))
+      doAction = false;
+    if (doAction && argTab['^group'].value != null && (argTab['^group'].value.test(stats.gid) || argTab['^group'].value.test(groupMap[stats.gid])))
+      doAction = false;
+
+    if (doAction && argTab.perm.value !== null && !(argTab.perm.value.test(permString(stats)) || argTab.perm.value.test(permOctalString(stats))))
+      doAction = false;
+    if (doAction && argTab['^perm'].value != null && (argTab['^perm'].value.test(permString(stats)) || argTab['^perm'].value.test(permOctalString(stats))))
+      doAction = false;
+
+    if (doAction && argTab.suid.value !== null && !((stats.mode & 04000) == 04000))
+      doAction = false;
+    if (doAction && argTab['^suid'].value != null && (stats.mode & 04000) == 04000)
+      doAction = false;
+
+    if (doAction && argTab.guid.value !== null && !((stats.mode & 02000) == 02000))
+      doAction = false;
+    if (doAction && argTab['^guid'].value != null && (stats.mode & 02000) == 02000)
+      doAction = false;
+
+    if (doAction && argTab.sticky.value !== null && !((stats.mode & 01000) == 01000))
+      doAction = false;
+    if (doAction && argTab['^sticky'].value != null && (stats.mode & 01000) == 01000)
+      doAction = false;
+
+    if (doAction) {
+      if (argTab.stat.value)
+        process.stdout.write(fullPath + ' ' + JSON.stringify(stats, null, 0) + '\n');
+      if (argTab.ls.value)
+        process.stdout.write(modeLSString(stats) + ' ' +  pad(userMap[stats.uid] || stats.uid, 8) + ' ' +  pad(groupMap[stats.gid] || stats.gid, 8) + ' ' +
+                             pad(stats.size, 13) + ' ' +  dateToString(stats.mtime) + ' ' +  fullPath + '\n');
+      if (argTab.print.value)
+        process.stdout.write(fullPath + '\n');
+      if (argTab.print0.value)
+        process.stdout.write(fullPath + '\0');
+
+      if (argTab.grep.value != null) {
+        grep(argTab.grep.value, fullPath, handlerCallback);
+        return; // no handlerCallback below
+      }
+
+    }
+  }
+  handlerCallback();
+};
+
+var usage = function() {
+  return 'usage: ff [options] dir1...\n' +
+    'Find files satisfying a set of files and perform an action - like find with simplified syntax\n' +
+    '\n' +
+    ' Filters:\n' +
+    '  -name regex,  -^name regex    file name matches regex \n' +
+    '  -fname regex, -^fname regex   full path matches regex    \n' +
+    '  -type regex,  -^type regex    entry type matches regex (types are 1 char in [fdlbcps])    \n' +
+    '  -mtime time,  -^mtime time    modify time <= time    \n' +
+    '  -atime time,  -^atime time    access time <= time  \n' +
+    '  -ctime time,  -^ctime time    change / create time <= time  \n' +
+    '  -btime time,  -^btime time    birth time <= time (see node fs.Stats) \n' +
+    '  -size size,   -^size size     file size <= size   \n' +
+    '  -user regex,  -^user regex    file owner user / user ID matches regex  \n' +
+    '  -group regex, -^group regex   file owner group / group ID matches regex   \n' +
+    '  -perm regex,  -^perm regex    file permissions string / octal string matches regex  \n' +
+    '  -suid,        -^suid          file has suid bit set\n' +
+    '  -guid,        -^guid          file has guid bit set\n' +
+    '  -sticky,      -^sticky        file has sticky bit set\n' +
+    ' Modifiers:\n' +
+    '  -i                            any regex\'s that follow are case insensitive  \n' +
+    '  -e                            any access or line too long (grep) errors are silently ignored    \n' +
+    ' Actions:\n' +
+    '  -print                        print full path (default action) \n' +
+    '  -print0                       print full path with \\0 separator for xargs\n' +
+    '  -ls                           print ls type listing\n' +
+    '  -stat                         print raw stat result in JSON format \n' +
+    '  -grep regex                   print lines in file matching regex   \n' +
+    '\n' +
+    ' - regex "matches" means "contains" - use regex ^ and $ for beginning and end of string \n' +
+    ' - watch out for shell wildcards / globbing - safest to put regex in quotes \n' +
+    ' - regex chars used literally, e.g. "." need to be escaped ("any" char vs "period") \n' +
+    ' - time is a numeric value in seconds, numeric value can have a final m, h, d for minutes, hours, or days \n' +
+    ' - size is a numeric value in bytes, numeric value can have a final k, m, g for thousand, mega, or giga bytes \n' +
+    ' - permission is string like rwxrwxr-x or 775; a regex matching either will activate the filter \n' +
+    ' - user and group regex can match the string or numeric value to activate the filter \n' +
+    ' - all options, modifiers, actions, and dirs can be specified in any order; filters all must be satisfied to fire action \n' +
+    ' - find style "xdev" is default, i.e. don\'t descend dirs on other file systems \n' +
+    ' - linux getent command is spawned to get user and group names from system when needed \n' +
+    '\n' +
+    ' Examples:\n' +
+    '  ff ~ -mtime 3m -type f -name \'\\.(js|cc|dart)$\' -ls    # modified last 3 minutes, "file", extension is .js, .cc, or .dart \n' +
+    '  ff / -^user \'(dave|0)\' -ls -e                         # find files or dirs with owners other than dave or root (0), skip access errors \n' +
+    '  ff . -fname \'/obj$\' -type d -print0 | xargs -0 rm -rf # rm dirs containing path element "obj" \n' +
+    '  ff ~ -^size 10m -ls                                   # files with size > 10 000 000 bytes \n' +
+    '  ff ~ -size 0 -ls                                      # files with size == 0 bytes \n' +
+    '  ff ~ -type l -ls                                      # show links \n' +
+    '  ff ~ -type f -i -grep sqlite_busy                     # show lines in files containing case-insensitive SQLITE_BUSY \n' +
+    '';
+};
+
+var main = function() {
+  try {
+    parseArgs(process.argv.slice(2));
+  } catch (e) {
+    doExit(e.message);
+  }
+  if (parms.length == 0)
+    doExit(usage());
+  if (!argTab.print.value && !argTab.ls.value && !argTab.stat.value && !argTab.print0.value && !argTab.grep.value)
+    argTab.print.value = true;
+  needUserMaps = argTab.ls.value || argTab.user.value || argTab['^user'].value || argTab.group.value || argTab['^group'].value;
+
+  var nChecked = 0;
+  for (var i = 0; i < parms.length; ++i) {
+    var pi = parms[i];
+    fs.lstat(pi, function(err, stats) {
+      if (err || !stats.isDirectory())
+        doExit(err || 'Parameter must be a directory', pi);
+      if (++nChecked == parms.length) {
+        getUserMaps(function() {
+          serial(parms, function(parm, dirDoneCallback) {
+            processDir(parm, handleOne, dirDoneCallback);
+          }, function() {
+            process.exitCode = 0;
+          });
+        });
+      }
+    });
+  }
+};
+
+main();
+
+// /opt/dart-sdk/lib/typed_data/typed_data.dart {"dev":2051,"mode":33188,"nlink":1,"uid":0,"gid":0,"rdev":0,
+//"blksize":4096,"ino":131274,"size":61686,"blocks":128,"atime":"2015-03-13T23:54:06.000Z","mtime":"2014-11-27T08:55:03.000Z",
+//"ctime":"2015-03-13T23:54:06.000Z","birthtime":"2015-03-13T23:54:06.000Z"}
