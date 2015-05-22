@@ -169,7 +169,13 @@ var parseArgs = function(args) {
             case 'm': size *= 1000000;    break;
             case 'g': size *= 1000000000; break;
           }
-        argTabEntry.value = size;
+          argTabEntry.value = size;
+          break;
+        case 'i': // int
+          var matches = args[++i].match(/^([0-9]+)$/);
+          if (matches === null) doExit('Invalid int specifier: ' + args[i]);
+          var int = parseInt(matches[1], 10);
+          argTabEntry.value = int;
           break;
       }
     } else {
@@ -205,11 +211,11 @@ var getUserMaps = function(userMapsDoneCallback) {
     userMapsDoneCallback();
 };
 
-var processEntry = function(xdev, path, name, handler, entryDoneCallback) {
+var processEntry = function(xdev, path, name, depth, handler, entryDoneCallback) {
   var fullPath = getFullPath(path, name);
   fs.lstat(fullPath, function(err, stats) {
     handler(err, xdev, path, name, stats, function() {
-      if (!err && xdev == stats.dev && stats.isDirectory()) {
+      if (!err && xdev == stats.dev && stats.isDirectory() && --depth >= 0) {
         fs.readdir(fullPath, function(err, files) {
           if (err) {
             handler(err, xdev, path, name, null, function() {
@@ -217,7 +223,7 @@ var processEntry = function(xdev, path, name, handler, entryDoneCallback) {
             });
           } else {
             serial(files, function(file, fileDoneCallback) {
-              processEntry(xdev, fullPath, file, handler, fileDoneCallback);
+              processEntry(xdev, fullPath, file, depth, handler, fileDoneCallback);
             }, entryDoneCallback);
           }
         });
@@ -227,7 +233,7 @@ var processEntry = function(xdev, path, name, handler, entryDoneCallback) {
   });
 };
 
-var processDir = function(path, handler, dirDoneCallback) {
+var processDir = function(path, depth, handler, dirDoneCallback) {
   fs.lstat(path, function(err, stats) {
     if (err)
       doExit(err, {path: path});
@@ -239,7 +245,7 @@ var processDir = function(path, handler, dirDoneCallback) {
         doExit(err, {path: path});
       } else {
         serial(files, function(file, fileDoneCallback) {
-          processEntry(xdev, path, file, handler, fileDoneCallback);
+          processEntry(xdev, path, file, depth, handler, fileDoneCallback);
         }, dirDoneCallback);
       }
     });
@@ -346,6 +352,7 @@ var argTab = {
 
   'i':       {type: 'b', value: null},
   'e':       {type: 'b', value: null},
+  'depth':   {type: 'i', value: null},
 };
 
 var handleOne = function(err, xdev, path, name, stats, handlerCallback) {
@@ -469,6 +476,7 @@ var usage = function() {
     ' Modifiers:\n' +
     '  -i                            any regex\'s that follow are case insensitive  \n' +
     '  -e                            any access or line too long (grep) errors are silently ignored    \n' +
+    '  -depth                        max directory descend depth, 0 is top only, default is all depths    \n' +
     ' Actions:\n' +
     '  -print                        print full path (default action) \n' +
     '  -print0                       print full path with \\0 separator for xargs\n' +
@@ -519,7 +527,7 @@ var main = function() {
       if (++nChecked == parms.length) {
         getUserMaps(function() {
           serial(parms, function(parm, dirDoneCallback) {
-            processDir(parm, handleOne, dirDoneCallback);
+            processDir(parm, argTab.depth.value !== null ? argTab.depth.value : 999999999, handleOne, dirDoneCallback);
           }, function() {
             process.exitCode = 0;
           });
