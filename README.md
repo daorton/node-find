@@ -9,6 +9,7 @@ Find files satisfying a set of files and perform an action - like find with simp
  Filters:
   -name regex,  -^name regex    file name matches regex 
   -fname regex, -^fname regex   full path matches regex    
+  -ext csv,     -^ext csv       extension matches one of csv extensions w/o "."    
   -type regex,  -^type regex    entry type matches regex (types are 1 char in [fdlbcps])    
   -mtime time,  -^mtime time    modify time <= time    
   -atime time,  -^atime time    access time <= time  
@@ -24,12 +25,15 @@ Find files satisfying a set of files and perform an action - like find with simp
  Modifiers:
   -i                            any regex's that follow are case insensitive  
   -e                            any access or line too long (grep) errors are silently ignored    
+  -depth                        max directory descend depth, 0 is top only, default is all depths    
  Actions:
   -print                        print full path (default action) 
   -print0                       print full path with \0 separator for xargs
   -ls                           print ls type listing
   -stat                         print raw stat result in JSON format 
   -grep regex                   print lines in file matching regex   
+  -sum                          print final sum of size of all file entries 
+  -cksum                        print cksum of file 
 
  - regex "matches" means "contains" - use regex ^ and $ for beginning and end of string 
  - watch out for shell wildcards / globbing - safest to put regex in quotes 
@@ -50,5 +54,6 @@ Find files satisfying a set of files and perform an action - like find with simp
   ff ~ -size 0 -ls                                      # files with size == 0 bytes 
   ff ~ -type l -ls                                      # show links 
   ff ~ -type f -i -grep sqlite_busy                     # show lines in files containing case-insensitive SQLITE_BUSY 
+  ff . -ext cc,c,java                                   # files with extension
  
 ```
